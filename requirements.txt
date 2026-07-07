@@ -1,2 +1,5 @@
 pip install -e ".[smolvla]"
 pip install perforatedai
+pip install 'lerobot[dataset]'
+pip install wandb
+conda install -n smolvla -c conda-forge 'ffmpeg<8'

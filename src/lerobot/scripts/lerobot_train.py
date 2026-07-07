@@ -100,7 +100,7 @@ def perforate_policy(policy: PreTrainedPolicy) -> torch.nn.Module:
     GPA.pc.set_output_dimensions([-1, -1, 0])
 
     # PAI tracks but doesn't perforate this submodule
-    GPA.pc.set_module_ids_to_track([".vlm_with_expert"])
+    GPA.pc.set_module_ids_to_track([".model.vlm_with_expert"])
 
     # Sets a 1% -> 0.1% improvement threshold
     GPA.pc.set_improvement_threshold([0.01, 0.001, 0])
@@ -110,7 +110,14 @@ def perforate_policy(policy: PreTrainedPolicy) -> torch.nn.Module:
 
     print(f"Building Policy with Dendrites...")
 
-    return UPA.perforate_model(policy, save_name="smolvla_dendritic", maximizing_score=False)
+    perforated_policy = UPA.perforate_model(
+        policy, save_name="smolvla_dendritic", maximizing_score=False
+    )
+
+    # state_proj has Shape -> [B, H]
+    perforated_policy.model.state_proj.set_this_output_dimensions([-1, 0])
+
+    return perforated_policy
 
 
 def update_policy(
