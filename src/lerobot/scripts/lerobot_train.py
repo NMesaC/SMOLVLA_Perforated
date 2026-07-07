@@ -20,7 +20,6 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 
 import dataclasses
 import logging
-import sys
 import time
 from contextlib import nullcontext
 from pprint import pformat
@@ -42,17 +41,15 @@ from lerobot.common.train_utils import (
     load_training_batch_size,
     load_training_num_processes,
     load_training_state,
-    push_checkpoint_to_hub,
     save_checkpoint,
     update_last_checkpoint,
 )
 from lerobot.common.wandb_utils import WandBLogger
-from lerobot.configs import JobConfig, parser
+from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets import EpisodeAwareSampler, compute_sampler_state
 from lerobot.datasets.factory import make_train_eval_datasets
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
-from lerobot.jobs import submit_to_hf
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.rewards import make_reward_pre_post_processors
@@ -69,6 +66,14 @@ from lerobot.utils.utils import (
 )
 
 from .lerobot_eval import eval_policy_all
+
+try:
+    from perforatedai import globals_perforatedai as GPA
+    from perforatedai import utils_perforatedai as UPA
+
+    pai_available = True
+except ImportError:
+    pai_available = False
 
 
 def update_policy(
@@ -191,9 +196,6 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         cfg: A `TrainPipelineConfig` object containing all training configurations.
         accelerator: Optional Accelerator instance. If None, one will be created automatically.
     """
-    if cfg.job.is_remote:
-        return submit_to_hf(cfg)
-
     from lerobot.utils.import_utils import require_package
 
     require_package("accelerate", extra="training")
@@ -211,12 +213,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         # Accelerate auto-detects the device based on the available hardware and ignores the policy.device setting.
         # Force the device to be CPU when the active config's device is set to CPU (works for both policy and reward model training).
         force_cpu = cfg.trainable_config.device == "cpu"
-        # Drive Accelerate's autocast from policy.dtype (bf16/fp16 activate it; float32/absent -> launcher default).
-        policy_dtype = getattr(cfg.trainable_config, "dtype", None)
-        mixed_precision = {"bfloat16": "bf16", "float16": "fp16", "float32": "no"}.get(policy_dtype)
         accelerator = Accelerator(
             step_scheduler_with_optimizer=False,
-            mixed_precision=mixed_precision,
             kwargs_handlers=[ddp_kwargs],
             cpu=force_cpu,
         )
@@ -296,6 +294,21 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             rename_map=cfg.rename_map,
         )
 
+    pai_active = pai_available and cfg.pai_enable
+    if cfg.pai_enable and not pai_available:
+        logging.warning("cfg.pai_enable=True but perforatedai is not installed; training without dendrites.")
+    if pai_active and (
+        accelerator.num_processes > 1 or cfg.peft is not None or getattr(cfg.policy, "compile_model", False)
+    ):
+        logging.warning("PAI v1 supports only single-process, non-PEFT, non-compiled runs; disabling.")
+        pai_active = False
+
+    if pai_active:
+        GPA.pc.set_testing_dendrite_capacity(True)
+        GPA.pc.set_module_names_to_perforate(["Linear"])
+        GPA.pc.set_module_ids_to_track([".vlm_with_expert"])
+        policy = UPA.perforate_model(policy, save_name="smolvla_dendritic", maximizing_score=False)
+
     if cfg.peft is not None:
         if cfg.is_reward_model_training:
             raise ValueError("PEFT is only supported for policy training. ")
@@ -364,6 +377,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if is_main_process:
         logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
+    if pai_active:
+        GPA.pai_tracker.set_optimizer_instance(optimizer)
 
     # Create sample weighter if configured (e.g., for RA-BC training)
     sample_weighter = None
@@ -638,6 +653,20 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 if wandb_logger:
                     wandb_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
 
+            if pai_active:
+                raw_policy = accelerator.unwrap_model(policy)
+                raw_policy, restructured, training_complete = GPA.pai_tracker.add_validation_score(
+                    eval_loss, raw_policy
+                )
+                raw_policy = raw_policy.to(device)
+                if training_complete:
+                    logging.info("PAI training complete!")
+                    break
+                if restructured:
+                    optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, raw_policy)
+                    GPA.pai_tracker.set_optimizer_instance(optimizer)
+                    policy, optimizer = accelerator.prepare(raw_policy, optimizer)
+
         if cfg.save_checkpoint and is_saving_step:
             # Under FSDP, gathering the full model + optimizer state dicts is a cross-rank collective,
             # so all ranks must participate; rank 0 then writes the materialized dicts. For DDP /
@@ -665,12 +694,6 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     optim_state_dict=optim_state_dict,
                 )
                 update_last_checkpoint(checkpoint_dir)
-                if cfg.save_checkpoint_to_hub:
-                    push_checkpoint_to_hub(
-                        checkpoint_dir,
-                        cfg.policy.repo_id,
-                        private=cfg.policy.private,
-                    )
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
 
@@ -740,9 +763,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             unwrapped_model = accelerator.unwrap_model(policy)
             # PEFT only applies when training a policy — reward models use the plain path.
             if not cfg.is_reward_model_training and cfg.policy.use_peft:
-                unwrapped_model.push_model_to_hub(cfg, peft_model=unwrapped_model, dataset_meta=dataset.meta)
+                unwrapped_model.push_model_to_hub(cfg, peft_model=unwrapped_model)
             else:
-                unwrapped_model.push_model_to_hub(cfg, state_dict=model_state_dict, dataset_meta=dataset.meta)
+                unwrapped_model.push_model_to_hub(cfg, state_dict=model_state_dict)
             preprocessor.push_to_hub(active_cfg.repo_id)
             postprocessor.push_to_hub(active_cfg.repo_id)
 
@@ -751,25 +774,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     accelerator.end_training()
 
 
-def _remote_target_in_argv() -> bool:
-    """True when the CLI requests a remote HF Jobs run (--job.target=<non-local>)."""
-    target = None
-    args = sys.argv[1:]
-    for i, tok in enumerate(args):
-        if tok == "--job.target" and i + 1 < len(args):
-            target = args[i + 1]
-        elif tok.startswith("--job.target="):
-            target = tok.split("=", 1)[1]
-    return JobConfig.is_remote_target(target)
-
-
 def main():
     register_third_party_plugins()
-    if _remote_target_in_argv():
-        # The policy device is resolved on the remote pod, not here, so silence the
-        # client-side "Device '...' is not available" warning PreTrainedConfig emits
-        # while parsing the config (it fires before train() can dispatch remotely).
-        logging.getLogger("lerobot.configs.policies").setLevel(logging.ERROR)
     train()
 
 
