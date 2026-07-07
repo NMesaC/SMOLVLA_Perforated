@@ -1,0 +1,2 @@
+pip install -e ".[smolvla]"
+pip install perforatedai

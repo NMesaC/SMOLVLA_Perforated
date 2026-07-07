@@ -90,6 +90,10 @@ def perforate_policy(policy: PreTrainedPolicy) -> torch.nn.Module:
         policy (PreTrainedPolicy):
             - The SmolVLA policy to perforate
     """
+    # Full training mode
+    GPA.pc.set_testing_dendrite_capacity(False)
+
+    # Only perforate linear layers
     GPA.pc.set_module_names_to_perforate(["Linear"])
 
     # Shape -> [B, N, H]
@@ -100,6 +104,9 @@ def perforate_policy(policy: PreTrainedPolicy) -> torch.nn.Module:
 
     # Sets a 1% -> 0.1% improvement threshold
     GPA.pc.set_improvement_threshold([0.01, 0.001, 0])
+
+    # Silence diagnostics
+    GPA.pc.set_unwrapped_modules_confirmed(True)
 
     print(f"Building Policy with Dendrites...")
 
