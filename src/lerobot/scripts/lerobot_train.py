@@ -75,6 +75,36 @@ try:
 except ImportError:
     pai_available = False
 
+#
+"""
+Perforated AI Functions
+"""
+def perforate_policy(policy: PreTrainedPolicy) -> torch.nn.Module:
+    """
+    Configure PAI settings and apply perforation to the given SmolVLA policy.
+
+    Notes:
+        - N = Sequence length
+
+    Signature:
+        policy (PreTrainedPolicy):
+            - The SmolVLA policy to perforate
+    """
+    GPA.pc.set_module_names_to_perforate(["Linear"])
+
+    # Shape -> [B, N, H]
+    GPA.pc.set_output_dimensions([-1, -1, 0])
+
+    # PAI tracks but doesn't perforate this submodule
+    GPA.pc.set_module_ids_to_track([".vlm_with_expert"])
+
+    # Sets a 1% -> 0.1% improvement threshold
+    GPA.pc.set_improvement_threshold([0.01, 0.001, 0])
+
+    print(f"Building Policy with Dendrites...")
+
+    return UPA.perforate_model(policy, save_name="smolvla_dendritic", maximizing_score=False)
+
 
 def update_policy(
     train_metrics: MetricsTracker,
@@ -294,6 +324,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             rename_map=cfg.rename_map,
         )
 
+    # Perforate Model
     pai_active = pai_available and cfg.pai_enable
     if cfg.pai_enable and not pai_available:
         logging.warning("cfg.pai_enable=True but perforatedai is not installed; training without dendrites.")
@@ -302,12 +333,8 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     ):
         logging.warning("PAI v1 supports only single-process, non-PEFT, non-compiled runs; disabling.")
         pai_active = False
-
     if pai_active:
-        GPA.pc.set_testing_dendrite_capacity(True)
-        GPA.pc.set_module_names_to_perforate(["Linear"])
-        GPA.pc.set_module_ids_to_track([".vlm_with_expert"])
-        policy = UPA.perforate_model(policy, save_name="smolvla_dendritic", maximizing_score=False)
+        policy = perforate_policy(policy)
 
     if cfg.peft is not None:
         if cfg.is_reward_model_training:
