@@ -608,7 +608,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     if is_main_process:
         progbar = tqdm(
-            total=cfg.steps - step,
+            # PAI runs have no fixed step budget: training continues past cfg.steps until the
+            # dendrite search itself reports completion, so the total is unknown ahead of time.
+            total=None if pai_active else cfg.steps - step,
             desc="Training",
             unit="step",
             disable=inside_slurm(),
@@ -619,7 +621,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
-    for _ in range(step, cfg.steps):
+    # Non-PAI runs stop at cfg.steps as before. PAI runs ignore cfg.steps as an upper bound and keep
+    # going until add_validation_score reports training_complete (see pai_training_complete below).
+    pai_training_complete = False
+    while pai_active or step < cfg.steps:
         start_time = time.perf_counter()
         batch = next(dl_iter)
         for cam_key in dataset.meta.camera_keys:
@@ -702,7 +707,10 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 raw_policy = raw_policy.to(device)
                 if training_complete:
                     logging.info("PAI training complete!")
-                    break
+                    # Force a final checkpoint below (regardless of save_freq alignment) before
+                    # breaking out of the loop after this iteration finishes.
+                    is_saving_step = True
+                    pai_training_complete = True
                 if restructured:
                     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, raw_policy)
                     GPA.pai_tracker.set_optimizer_instance(optimizer)
@@ -788,6 +796,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
 
             accelerator.wait_for_everyone()
+
+        if pai_training_complete:
+            break
 
     if is_main_process:
         progbar.close()
