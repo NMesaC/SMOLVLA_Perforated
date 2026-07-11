@@ -728,6 +728,21 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     GPA.pai_tracker.set_optimizer_instance(optimizer)
                     policy, optimizer = accelerator.prepare(raw_policy, optimizer)
 
+                # PAI Logging
+                if is_main_process and wandb_logger:
+                    member_vars = GPA.pai_tracker.member_vars
+                    pai_log_dict = {
+                        "pai_restructured": int(restructured),
+                        "pai_training_complete": int(training_complete),
+                        "pai_num_cycles": member_vars["num_cycles"],
+                        "pai_num_dendrites_added": member_vars["num_dendrites_added"],
+                        "pai_num_dendrites_integrated": member_vars["num_dendrites_integrated"],
+                        "pai_is_p_mode": int(member_vars["mode"] == "p"),
+                    }
+                    if member_vars["param_counts"]:
+                        pai_log_dict["pai_param_count"] = member_vars["param_counts"][-1]
+                    wandb_logger.log_dict(pai_log_dict, step=step, mode="eval")
+
         if cfg.save_checkpoint and is_saving_step:
             # Under FSDP, gathering the full model + optimizer state dicts is a cross-rank collective,
             # so all ranks must participate; rank 0 then writes the materialized dicts. For DDP /

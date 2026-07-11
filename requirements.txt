@@ -3,3 +3,7 @@ pip install perforatedai
 pip install 'lerobot[dataset]'
 pip install wandb
 conda install -n smolvla -c conda-forge 'ffmpeg<8'
+export MUJOCO_GL=egl
+sudo dnf install -y cmake mesa-libEGL-devel mesa-libGL-devel mesa-libGLU-devel gcc gcc-c++
+pip uninstall -y cmake ninja
+pip install -e ".[libero]"
