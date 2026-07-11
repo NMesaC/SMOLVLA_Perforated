@@ -74,6 +74,7 @@ from tqdm import trange
 
 from lerobot.configs import FeatureType, parser
 from lerobot.configs.eval import EvalPipelineConfig
+from lerobot.configs.train import TRAIN_CONFIG_NAME
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.envs import (
     check_env_attributes_and_types,
@@ -85,7 +86,7 @@ from lerobot.envs import (
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.types import PolicyAction
-from lerobot.utils.constants import ACTION, DONE, OBS_IMAGE, OBS_IMAGES, OBS_STR, REWARD
+from lerobot.utils.constants import ACTION, DONE, OBS_IMAGE, OBS_IMAGES, OBS_STR, PAI_SYSTEM_NAME, REWARD
 from lerobot.utils.device_utils import get_safe_torch_device
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.io_utils import write_video
@@ -94,6 +95,61 @@ from lerobot.utils.utils import (
     init_logging,
     inside_slurm,
 )
+
+try:
+    from perforatedai import utils_perforatedai as UPA
+    pai_available = True
+except ImportError:
+    pai_available = False
+
+
+def pai_enable_from_checkpoint(pretrained_path: str | Path) -> bool:
+    # Read the sibling train_config.json for pai_enable, since cfg.policy alone
+    # (a PreTrainedConfig) doesn't carry that TrainPipelineConfig-only field.
+    train_config_file = Path(pretrained_path) / TRAIN_CONFIG_NAME
+    if not train_config_file.is_file():
+        return False
+    with open(train_config_file) as f:
+        return bool(json.load(f).get("pai_enable", False))
+
+
+def load_pai_eval_policy(
+    policy: PreTrainedPolicy, pretrained_path: str | Path, device: torch.device
+) -> PreTrainedPolicy:
+    """
+    Re-perforate `policy` and restore its dendrite structure + weights from
+    the PAI system checkpoint saved alongside `pretrained_path` by
+    lerobot_train.py's UPA.save_system call.
+
+    Notes:
+        - Plain make_policy/from_pretrained silently drops perforated-layer
+            weights (their key names only exist after perforation), so this
+            must be called instead for a PAI checkpoint.
+        - Raises if no PAI system checkpoint is present, matching
+            lerobot_train.py's resume behavior, rather than silently
+            falling back to an unperforated or freshly-perforated policy.
+
+    Signature:
+        policy (PreTrainedPolicy):
+            - Freshly built, not-yet-perforated policy
+        pretrained_path (str | Path):
+            - Checkpoint dir (contains model.safetensors and, for a PAI
+              checkpoint, pai_system.pt)
+        device (torch.device):
+            - Device to move the loaded policy to
+    """
+    from lerobot.scripts.lerobot_train import perforate_policy
+
+    pai_system_dir = Path(pretrained_path)
+    pai_system_file = pai_system_dir / f"{PAI_SYSTEM_NAME}.pt"
+    if not pai_system_file.is_file():
+        raise FileNotFoundError(
+            f"No PAI system checkpoint at {pai_system_file}. This checkpoint was saved before "
+            "PAI system checkpointing was added, or pai_enable was False when it was saved."
+        )
+    policy = perforate_policy(policy)
+    policy = UPA.load_system(policy, str(pai_system_dir), PAI_SYSTEM_NAME, True)
+    return policy.to(device)
 
 
 def _env_features_to_dataset_features(env_features: dict) -> dict:
@@ -750,6 +806,14 @@ def eval_main(cfg: EvalPipelineConfig):
         env_cfg=cfg.env,
         rename_map=cfg.rename_map,
     )
+
+    if (
+        pai_available
+        and cfg.policy.pretrained_path
+        and pai_enable_from_checkpoint(cfg.policy.pretrained_path)
+    ):
+        logging.info("Checkpoint was trained with pai_enable=True; reloading dendrite weights.")
+        policy = load_pai_eval_policy(policy, cfg.policy.pretrained_path, device)
 
     policy.eval()
 

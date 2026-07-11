@@ -44,10 +44,13 @@ ROBOTS = "robots"
 TELEOPERATORS = "teleoperators"
 
 # files & directories
+# NOTE: We add a PAI_SYSTEM_NAME so we know what prefix the PAI model's use
+# This is consistent with lerobot_train.py and lerobot_eval.py
 CHECKPOINTS_DIR = "checkpoints"
 LAST_CHECKPOINT_LINK = "last"
 PRETRAINED_MODEL_DIR = "pretrained_model"
 TRAINING_STATE_DIR = "training_state"
+PAI_SYSTEM_NAME = "pai_system"
 ALGORITHM_DIR = "algorithm"
 RNG_STATE = "rng_state.safetensors"
 TRAINING_STEP = "training_step.json"

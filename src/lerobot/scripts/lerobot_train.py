@@ -54,6 +54,7 @@ from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.collate import lerobot_collate_fn
+from lerobot.utils.constants import PAI_SYSTEM_NAME, PRETRAINED_MODEL_DIR
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
@@ -338,7 +339,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             rename_map=cfg.rename_map,
         )
 
-    # Perforate Model
+    # See if we can activate PAI
     pai_active = pai_available and cfg.pai_enable
     if cfg.pai_enable and not pai_available:
         logging.warning("cfg.pai_enable=True but perforatedai is not installed; training without dendrites.")
@@ -347,8 +348,22 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     ):
         logging.warning("PAI v1 supports only single-process, non-PEFT, non-compiled runs; disabling.")
         pai_active = False
+
+    # Perforate the model
     if pai_active:
         policy = perforate_policy(policy)
+        if cfg.resume:
+            # NOTE: To load a perforated model, we have to use PAI functions
+            pai_system_dir  = cfg.checkpoint_path / PRETRAINED_MODEL_DIR
+            pai_system_file = pai_system_dir / f"{PAI_SYSTEM_NAME}.pt"
+            if not pai_system_file.is_file():
+                raise FileNotFoundError(
+                    f"No PAI system checkpoint at {pai_system_file}. This checkpoint was saved "
+                    "before PAI system checkpointing was added, or pai_enable was False when it "
+                    "was saved."
+                )
+            logging.info(f"Restoring PAI dendrite structure and tracker state from {pai_system_dir}")
+            policy = UPA.load_system(policy, str(pai_system_dir), PAI_SYSTEM_NAME, True)
 
     if cfg.peft is not None:
         if cfg.is_reward_model_training:
@@ -608,8 +623,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     if is_main_process:
         progbar = tqdm(
-            # PAI runs have no fixed step budget: training continues past cfg.steps until the
-            # dendrite search itself reports completion, so the total is unknown ahead of time.
+            # No progress bar for PAI since it runs until no more improvement occurs
             total=None if pai_active else cfg.steps - step,
             desc="Training",
             unit="step",
@@ -621,8 +635,6 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
-    # Non-PAI runs stop at cfg.steps as before. PAI runs ignore cfg.steps as an upper bound and keep
-    # going until add_validation_score reports training_complete (see pai_training_complete below).
     pai_training_complete = False
     while pai_active or step < cfg.steps:
         start_time = time.perf_counter()
@@ -742,6 +754,13 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     model_state_dict=model_state_dict,
                     optim_state_dict=optim_state_dict,
                 )
+                if pai_active:
+                    # Save all relevant PAI information
+                    UPA.save_system(
+                        accelerator.unwrap_model(policy),
+                        str(checkpoint_dir / PRETRAINED_MODEL_DIR),
+                        PAI_SYSTEM_NAME,
+                    )
                 update_last_checkpoint(checkpoint_dir)
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
