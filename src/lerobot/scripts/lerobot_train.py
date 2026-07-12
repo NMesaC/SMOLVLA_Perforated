@@ -635,6 +635,71 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
+    def run_env_eval(eval_step: int) -> None:
+        """Roll out the policy in `eval_env` and log aggregate success/reward metrics to wandb."""
+        if is_main_process:
+            step_id = get_step_identifier(eval_step, cfg.steps)
+            logging.info(f"Eval policy at step {eval_step}")
+            with torch.no_grad(), accelerator.autocast():
+                eval_info = eval_policy_all(
+                    envs=eval_env,  # dict[suite][task_id] -> vec_env
+                    policy=accelerator.unwrap_model(policy),
+                    env_preprocessor=env_preprocessor,
+                    env_postprocessor=env_postprocessor,
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    n_episodes=cfg.eval.n_episodes,
+                    videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
+                    max_episodes_rendered=4,
+                    start_seed=cfg.seed,
+                    max_parallel_tasks=cfg.env.max_parallel_tasks,
+                )
+                # overall metrics (suite-agnostic)
+                aggregated = eval_info["overall"]
+
+                # optional: per-suite logging
+                for suite, suite_info in eval_info.items():
+                    logging.info("Suite %s aggregated: %s", suite, suite_info)
+
+                # meters/tracker
+                eval_metrics = {
+                    "avg_sum_reward": AverageMeter("∑rwrd", ":.3f"),
+                    "pc_success": AverageMeter("success", ":.1f"),
+                    "eval_s": AverageMeter("eval_s", ":.3f"),
+                }
+                eval_tracker = MetricsTracker(
+                    cfg.batch_size,
+                    dataset.num_frames,
+                    dataset.num_episodes,
+                    eval_metrics,
+                    initial_step=eval_step,
+                    accelerator=accelerator,
+                )
+                eval_tracker.eval_s = aggregated.pop("eval_s")
+                eval_tracker.avg_sum_reward = aggregated.pop("avg_sum_reward")
+                eval_tracker.pc_success = aggregated.pop("pc_success")
+                if wandb_logger:
+                    wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
+                    wandb_logger.log_dict(wandb_log_dict, eval_step, mode="eval")
+                    wandb_logger.log_video(eval_info["overall"]["video_paths"][0], eval_step, mode="eval")
+
+        accelerator.wait_for_everyone()
+
+    # A crash between checkpointing and env-eval at the same step (e.g. the LIBERO render-context
+    # bug) leaves that step's checkpoint saved but its env-eval never logged, and the training loop
+    # below only re-triggers eval on the *next* env_eval_freq boundary. Backfill the missed eval once
+    # here, before resuming, so it still lands in wandb at the right step.
+    if (
+        cfg.resume
+        and cfg.env is not None
+        and eval_env is not None
+        and step > 0
+        and cfg.env_eval_freq > 0
+        and step % cfg.env_eval_freq == 0
+    ):
+        logging.info(f"Resuming at an env-eval boundary (step {step}); backfilling the missed eval.")
+        run_env_eval(step)
+
     pai_training_complete = False
     while pai_active or step < cfg.steps:
         start_time = time.perf_counter()
@@ -783,53 +848,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             accelerator.wait_for_everyone()
 
         if cfg.env and is_env_eval_step:
-            if is_main_process:
-                step_id = get_step_identifier(step, cfg.steps)
-                logging.info(f"Eval policy at step {step}")
-                with torch.no_grad(), accelerator.autocast():
-                    eval_info = eval_policy_all(
-                        envs=eval_env,  # dict[suite][task_id] -> vec_env
-                        policy=accelerator.unwrap_model(policy),
-                        env_preprocessor=env_preprocessor,
-                        env_postprocessor=env_postprocessor,
-                        preprocessor=preprocessor,
-                        postprocessor=postprocessor,
-                        n_episodes=cfg.eval.n_episodes,
-                        videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
-                        max_episodes_rendered=4,
-                        start_seed=cfg.seed,
-                        max_parallel_tasks=cfg.env.max_parallel_tasks,
-                    )
-                # overall metrics (suite-agnostic)
-                aggregated = eval_info["overall"]
-
-                # optional: per-suite logging
-                for suite, suite_info in eval_info.items():
-                    logging.info("Suite %s aggregated: %s", suite, suite_info)
-
-                # meters/tracker
-                eval_metrics = {
-                    "avg_sum_reward": AverageMeter("∑rwrd", ":.3f"),
-                    "pc_success": AverageMeter("success", ":.1f"),
-                    "eval_s": AverageMeter("eval_s", ":.3f"),
-                }
-                eval_tracker = MetricsTracker(
-                    cfg.batch_size,
-                    dataset.num_frames,
-                    dataset.num_episodes,
-                    eval_metrics,
-                    initial_step=step,
-                    accelerator=accelerator,
-                )
-                eval_tracker.eval_s = aggregated.pop("eval_s")
-                eval_tracker.avg_sum_reward = aggregated.pop("avg_sum_reward")
-                eval_tracker.pc_success = aggregated.pop("pc_success")
-                if wandb_logger:
-                    wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
-                    wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
-                    wandb_logger.log_video(eval_info["overall"]["video_paths"][0], step, mode="eval")
-
-            accelerator.wait_for_everyone()
+            run_env_eval(step)
 
         if pai_training_complete:
             break

@@ -380,6 +380,10 @@ class LiberoEnv(gym.Env):
     def close(self):
         if self._env is not None:
             self._env.close()
+            # Reused across periodic evals during training, so _ensure_env()
+            # must rebuild a fresh render context next time instead of
+            # reusing this now-torn-down one.
+            self._env = None
 
 
 def _make_env_fns(
