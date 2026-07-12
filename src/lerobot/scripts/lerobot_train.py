@@ -635,7 +635,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
-    def run_env_eval(eval_step: int) -> None:
+    def run_env_eval(eval_step: int, wandb_step: int | None = None) -> None:
         """Roll out the policy in `eval_env` and log aggregate success/reward metrics to wandb."""
         if is_main_process:
             step_id = get_step_identifier(eval_step, cfg.steps)
@@ -679,16 +679,18 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 eval_tracker.avg_sum_reward = aggregated.pop("avg_sum_reward")
                 eval_tracker.pc_success = aggregated.pop("pc_success")
                 if wandb_logger:
+                    step_for_wandb = wandb_step if wandb_step is not None else eval_step
                     wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
-                    wandb_logger.log_dict(wandb_log_dict, eval_step, mode="eval")
-                    wandb_logger.log_video(eval_info["overall"]["video_paths"][0], eval_step, mode="eval")
+                    wandb_logger.log_dict(wandb_log_dict, step_for_wandb, mode="eval")
+                    wandb_logger.log_video(
+                        eval_info["overall"]["video_paths"][0], step_for_wandb, mode="eval"
+                    )
 
         accelerator.wait_for_everyone()
 
-    # A crash between checkpointing and env-eval at the same step (e.g. the LIBERO render-context
-    # bug) leaves that step's checkpoint saved but its env-eval never logged, and the training loop
-    # below only re-triggers eval on the *next* env_eval_freq boundary. Backfill the missed eval once
-    # here, before resuming, so it still lands in wandb at the right step.
+    # NOTE: We had a crash between at step 10k due to a Libero environment bug
+    # This snippet will re-run the evaluation if the last recorded step is an
+    # eval_step
     if (
         cfg.resume
         and cfg.env is not None
@@ -698,7 +700,25 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         and step % cfg.env_eval_freq == 0
     ):
         logging.info(f"Resuming at an env-eval boundary (step {step}); backfilling the missed eval.")
-        run_env_eval(step)
+        # Ensures the wandb step counter is synced up properly
+        if wandb_logger:
+            run = wandb_logger._wandb.run
+            api_run = wandb_logger._wandb.Api().run(f"{run.entity}/{run.project}/{run.id}")
+            last_synced_step = api_run.summary.get("_step") or 0
+            backfill_wandb_step = max(step, last_synced_step + 1)
+            logging.info(
+                f"[wandb backfill debug] checkpoint step={step}, "
+                f"last_synced_step(wandb Api)={last_synced_step}, "
+                f"backfill_wandb_step={backfill_wandb_step}"
+            )
+            print(
+                f"[wandb backfill debug] checkpoint step={step}, "
+                f"last_synced_step(wandb Api)={last_synced_step}, "
+                f"backfill_wandb_step={backfill_wandb_step}"
+            )
+        else:
+            backfill_wandb_step = step
+        run_env_eval(step, wandb_step=backfill_wandb_step)
 
     pai_training_complete = False
     while pai_active or step < cfg.steps:
