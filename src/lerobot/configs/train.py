@@ -128,6 +128,9 @@ class TrainPipelineConfig(HubMixin):
     # Add PerforatedAI dendrites to the policy. Requires the `perforatedai` package; ignored (with a
     # warning) if it isn't installed. Supported only for single-process, non-PEFT, non-compiled runs.
     pai_enable: bool = False
+    # PAI's patience: number of validation checks (each `env_eval_freq` steps) without a
+    # significant pc_success improvement before it reloads the best checkpoint and adds a dendrite.
+    pai_n_epochs_to_switch: int = 10
 
     @property
     def is_reward_model_training(self) -> bool:

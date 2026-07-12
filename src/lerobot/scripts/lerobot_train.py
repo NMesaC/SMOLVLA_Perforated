@@ -80,7 +80,7 @@ except ImportError:
 """
 Perforated AI Functions
 """
-def perforate_policy(policy: PreTrainedPolicy) -> torch.nn.Module:
+def perforate_policy(policy: PreTrainedPolicy, n_epochs_to_switch: int = 10) -> torch.nn.Module:
     """
     Configure PAI settings and apply perforation to the given SmolVLA policy.
 
@@ -90,6 +90,8 @@ def perforate_policy(policy: PreTrainedPolicy) -> torch.nn.Module:
     Signature:
         policy (PreTrainedPolicy):
             - The SmolVLA policy to perforate
+        n_epochs_to_switch (int):
+            - PAI's patience: validation checks without improvement before adding a dendrite.
     """
     # Full training mode
     GPA.pc.set_testing_dendrite_capacity(False)
@@ -106,13 +108,17 @@ def perforate_policy(policy: PreTrainedPolicy) -> torch.nn.Module:
     # Sets a 1% -> 0.1% improvement threshold
     GPA.pc.set_improvement_threshold([0.01, 0.001, 0])
 
+    # Patience: validation checks without improvement before reloading the best checkpoint
+    # and adding a dendrite.
+    GPA.pc.set_n_epochs_to_switch(n_epochs_to_switch)
+
     # Silence diagnostics
     GPA.pc.set_unwrapped_modules_confirmed(True)
 
     print(f"Building Policy with Dendrites...")
 
     perforated_policy = UPA.perforate_model(
-        policy, save_name="smolvla_dendritic", maximizing_score=False
+        policy, save_name="smolvla_dendritic", maximizing_score=True
     )
 
     # state_proj has Shape -> [B, H]
@@ -351,7 +357,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
 
     # Perforate the model
     if pai_active:
-        policy = perforate_policy(policy)
+        policy = perforate_policy(policy, n_epochs_to_switch=cfg.pai_n_epochs_to_switch)
         if cfg.resume:
             # NOTE: To load a perforated model, we have to use PAI functions
             pai_system_dir  = cfg.checkpoint_path / PRETRAINED_MODEL_DIR
@@ -635,8 +641,12 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
-    def run_env_eval(eval_step: int, wandb_step: int | None = None) -> None:
-        """Roll out the policy in `eval_env` and log aggregate success/reward metrics to wandb."""
+    def run_env_eval(eval_step: int, wandb_step: int | None = None) -> float | None:
+        """Roll out the policy in `eval_env` and log aggregate success/reward metrics to wandb.
+
+        Returns the aggregate pc_success (0-100) on the main process, None on other ranks.
+        """
+        pc_success = None
         if is_main_process:
             step_id = get_step_identifier(eval_step, cfg.steps)
             logging.info(f"Eval policy at step {eval_step}")
@@ -678,6 +688,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 eval_tracker.eval_s = aggregated.pop("eval_s")
                 eval_tracker.avg_sum_reward = aggregated.pop("avg_sum_reward")
                 eval_tracker.pc_success = aggregated.pop("pc_success")
+                pc_success = eval_tracker.pc_success
                 if wandb_logger:
                     step_for_wandb = wandb_step if wandb_step is not None else eval_step
                     wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
@@ -687,6 +698,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                     )
 
         accelerator.wait_for_everyone()
+        return pc_success
 
     # NOTE: We had a crash between at step 10k due to a Libero environment bug
     # This snippet will re-run the evaluation if the last recorded step is an
@@ -796,38 +808,6 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
                 if wandb_logger:
                     wandb_logger.log_dict({"eval_loss": eval_loss}, step=step, mode="eval")
 
-            if pai_active:
-                raw_policy = accelerator.unwrap_model(policy)
-                raw_policy, restructured, training_complete = GPA.pai_tracker.add_validation_score(
-                    eval_loss, raw_policy
-                )
-                raw_policy = raw_policy.to(device)
-                if training_complete:
-                    logging.info("PAI training complete!")
-                    # Force a final checkpoint below (regardless of save_freq alignment) before
-                    # breaking out of the loop after this iteration finishes.
-                    is_saving_step = True
-                    pai_training_complete = True
-                if restructured:
-                    optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, raw_policy)
-                    GPA.pai_tracker.set_optimizer_instance(optimizer)
-                    policy, optimizer = accelerator.prepare(raw_policy, optimizer)
-
-                # PAI Logging
-                if is_main_process and wandb_logger:
-                    member_vars = GPA.pai_tracker.member_vars
-                    pai_log_dict = {
-                        "pai_restructured": int(restructured),
-                        "pai_training_complete": int(training_complete),
-                        "pai_num_cycles": member_vars["num_cycles"],
-                        "pai_num_dendrites_added": member_vars["num_dendrites_added"],
-                        "pai_num_dendrites_integrated": member_vars["num_dendrites_integrated"],
-                        "pai_is_p_mode": int(member_vars["mode"] == "p"),
-                    }
-                    if member_vars["param_counts"]:
-                        pai_log_dict["pai_param_count"] = member_vars["param_counts"][-1]
-                    wandb_logger.log_dict(pai_log_dict, step=step, mode="eval")
-
         if cfg.save_checkpoint and is_saving_step:
             # Under FSDP, gathering the full model + optimizer state dicts is a cross-rank collective,
             # so all ranks must participate; rank 0 then writes the materialized dicts. For DDP /
@@ -868,7 +848,46 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             accelerator.wait_for_everyone()
 
         if cfg.env and is_env_eval_step:
-            run_env_eval(step)
+            pc_success = run_env_eval(step)
+
+            if pai_active:
+                # env rollouts only run on the main process, so broadcast pc_success to every
+                # rank before calling add_validation_score, keeping PAI's restructuring decision
+                # (and the resulting policy/optimizer rebuild below) identical across ranks.
+                pc_success_t = torch.tensor(pc_success if is_main_process else 0.0, device=device)
+                pc_success_t = accelerator.reduce(pc_success_t, reduction="sum")
+                pc_success = pc_success_t.item()
+
+                raw_policy = accelerator.unwrap_model(policy)
+                raw_policy, restructured, training_complete = GPA.pai_tracker.add_validation_score(
+                    pc_success, raw_policy
+                )
+                raw_policy = raw_policy.to(device)
+                if training_complete:
+                    logging.info("PAI training complete!")
+                    # Force a final checkpoint below (regardless of save_freq alignment) before
+                    # breaking out of the loop after this iteration finishes.
+                    is_saving_step = True
+                    pai_training_complete = True
+                if restructured:
+                    optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, raw_policy)
+                    GPA.pai_tracker.set_optimizer_instance(optimizer)
+                    policy, optimizer = accelerator.prepare(raw_policy, optimizer)
+
+                # PAI Logging
+                if is_main_process and wandb_logger:
+                    member_vars = GPA.pai_tracker.member_vars
+                    pai_log_dict = {
+                        "pai_restructured": int(restructured),
+                        "pai_training_complete": int(training_complete),
+                        "pai_num_cycles": member_vars["num_cycles"],
+                        "pai_num_dendrites_added": member_vars["num_dendrites_added"],
+                        "pai_num_dendrites_integrated": member_vars["num_dendrites_integrated"],
+                        "pai_is_p_mode": int(member_vars["mode"] == "p"),
+                    }
+                    if member_vars["param_counts"]:
+                        pai_log_dict["pai_param_count"] = member_vars["param_counts"][-1]
+                    wandb_logger.log_dict(pai_log_dict, step=step, mode="eval")
 
         if pai_training_complete:
             break
